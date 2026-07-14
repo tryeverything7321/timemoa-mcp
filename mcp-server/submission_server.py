@@ -541,12 +541,39 @@ def _build_candidate_output(room: dict, limit: int) -> CandidateOutput:
         "openWorldHint": False,
     },
 )
-async def coordinate_schedule(params: CoordinateScheduleInput) -> CoordinateScheduleOutput:
+async def coordinate_schedule(
+    title: str,
+    date_start: str,
+    date_end: str,
+    participants: list[ParticipantInput],
+    daily_start: str = "09:00",
+    daily_end: str = "18:00",
+    duration_minutes: int = 60,
+    limit: int = 3,
+) -> CoordinateScheduleOutput:
     """현재 AI 대화에서 확인된 여러 참여자의 조건을 한 번에 저장하고 후보를 계산한다.
 
     임의의 카카오톡 방을 읽지 않는다. Agent가 현재 대화에 제공된 참여자별 조건을
     구조화해 전달하며, 조건이 없는 참여자는 이름만 넣어 후속 확인 대상으로 남긴다.
     """
+    try:
+        params = CoordinateScheduleInput(
+            title=title,
+            date_start=date_start,
+            date_end=date_end,
+            participants=participants,
+            daily_start=daily_start,
+            daily_end=daily_end,
+            duration_minutes=duration_minutes,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return CoordinateScheduleOutput(
+            status="invalid_request",
+            share_message="조율을 시작하지 못했습니다.",
+            message=str(exc),
+        )
+
     if not _allow_room_creation():
         return CoordinateScheduleOutput(
             status="rate_limited",
@@ -660,8 +687,27 @@ async def coordinate_schedule(params: CoordinateScheduleInput) -> CoordinateSche
         "openWorldHint": False,
     },
 )
-async def submit_participant_preference(params: SubmitPreferenceInput) -> SubmitPreferenceOutput:
+async def submit_participant_preference(
+    coordination_id: str,
+    participant: str,
+    covers_time_window: bool,
+    hard_blocks: list[TimeIntervalInput] | None = None,
+    avoid: list[TimeIntervalInput] | None = None,
+    prefer: list[TimeIntervalInput] | None = None,
+) -> SubmitPreferenceOutput:
     """이전 조율의 한 참여자 조건을 추가하거나 교체한다. Agent가 내부 ID를 재사용한다."""
+    try:
+        params = SubmitPreferenceInput(
+            coordination_id=coordination_id,
+            participant=participant,
+            covers_time_window=covers_time_window,
+            hard_blocks=hard_blocks or [],
+            avoid=avoid or [],
+            prefer=prefer or [],
+        )
+    except ValueError as exc:
+        return SubmitPreferenceOutput(status="invalid_request", message=str(exc))
+
     try:
         with _connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -722,8 +768,16 @@ async def submit_participant_preference(params: SubmitPreferenceInput) -> Submit
         "openWorldHint": False,
     },
 )
-async def get_coordination_candidates(params: GetCandidatesInput) -> CandidateOutput:
+async def get_coordination_candidates(
+    coordination_id: str,
+    limit: int = 3,
+) -> CandidateOutput:
     """이전 조율의 최신 후보를 반환한다. Agent가 내부 ID를 재사용한다."""
+    try:
+        params = GetCandidatesInput(coordination_id=coordination_id, limit=limit)
+    except ValueError as exc:
+        return CandidateOutput(status="invalid_request", message=str(exc))
+
     try:
         with _connect() as connection:
             room = _load_room(connection, params.coordination_id)

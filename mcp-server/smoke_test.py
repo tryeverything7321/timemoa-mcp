@@ -9,7 +9,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 
 async def call(session: ClientSession, name: str, params: dict) -> dict:
-    result = await session.call_tool(name, {"params": params})
+    result = await session.call_tool(name, params)
     if result.isError:
         raise RuntimeError(f"{name} failed: {result.content}")
     if result.structuredContent:
@@ -19,10 +19,13 @@ async def call(session: ClientSession, name: str, params: dict) -> dict:
     return json.loads(result.content[0].text)
 
 
-async def expect_tool_error(session: ClientSession, name: str, params: dict) -> None:
-    result = await session.call_tool(name, {"params": params})
-    if not result.isError:
-        raise RuntimeError(f"{name} unexpectedly succeeded: {result.structuredContent}")
+async def expect_invalid_request(session: ClientSession, name: str, params: dict) -> None:
+    result = await session.call_tool(name, params)
+    if result.isError:
+        return
+    data = result.structuredContent
+    if not data or data.get("status") != "invalid_request":
+        raise RuntimeError(f"{name} unexpectedly succeeded: {data}")
 
 
 async def submit(
@@ -64,16 +67,29 @@ async def main() -> None:
             assert "covers_time_window" in schema_text
             assert "hard_blocks" in schema_text
             coordinate_tool = tools_by_name["coordinate_schedule"]
-            coordinate_schema = coordinate_tool.inputSchema
-            assert set(coordinate_schema["properties"]) == {"params"}
-            coordinate_params = coordinate_schema["$defs"]["CoordinateScheduleInput"]
+            coordinate_params = coordinate_tool.inputSchema
             assert set(coordinate_params["required"]) == {
                 "title", "date_start", "date_end", "participants",
             }
-            assert coordinate_params["properties"]["limit"]["maximum"] == 3
+            assert set(coordinate_params["properties"]) == {
+                "title",
+                "date_start",
+                "date_end",
+                "participants",
+                "daily_start",
+                "daily_end",
+                "duration_minutes",
+                "limit",
+            }
             assert "timezone" not in coordinate_params["properties"]
-            participant_schema = coordinate_schema["$defs"]["ParticipantInput"]
+            participant_schema = coordinate_params["$defs"]["ParticipantInput"]
             assert "required" not in participant_schema["properties"]
+            submit_schema = tools_by_name["submit_participant_preference"].inputSchema
+            assert set(submit_schema["required"]) == {
+                "coordination_id", "participant", "covers_time_window",
+            }
+            assert "name" not in submit_schema["properties"]
+            assert "availability" not in submit_schema["properties"]
             assert coordinate_tool.outputSchema is not None
             assert "coordination_id" in coordinate_tool.outputSchema["properties"]
 
@@ -158,7 +174,7 @@ async def main() -> None:
             assert missing_room["status"] == "not_found"
             assert coordination_id not in json.dumps(missing_room, ensure_ascii=False)
 
-            await expect_tool_error(session, "coordinate_schedule", {
+            await expect_invalid_request(session, "coordinate_schedule", {
                 "title": "너무 긴 회의",
                 "date_start": "2026-07-20",
                 "date_end": "2026-07-20",
@@ -167,13 +183,13 @@ async def main() -> None:
                 "duration_minutes": 120,
                 "participants": [{"name": "가람"}, {"name": "나래"}],
             })
-            await expect_tool_error(session, "coordinate_schedule", {
+            await expect_invalid_request(session, "coordinate_schedule", {
                 "title": "너무 넓은 범위",
                 "date_start": "2026-07-01",
                 "date_end": "2026-07-15",
                 "participants": [{"name": "가람"}, {"name": "나래"}],
             })
-            await expect_tool_error(session, "coordinate_schedule", {
+            await expect_invalid_request(session, "coordinate_schedule", {
                 "title": "시간대 포함 입력",
                 "date_start": "2026-07-20",
                 "date_end": "2026-07-20",
