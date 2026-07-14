@@ -187,6 +187,46 @@ async def main() -> None:
             })
             assert completed_result["status"] == "ready"
 
+            partial = await call(session, "coordinate_schedule", {
+                "title": "부분 정보 회의",
+                "date_start": "2026-07-20",
+                "date_end": "2026-07-20",
+                "daily_start": "09:00",
+                "daily_end": "12:00",
+                "timezone": "Asia/Seoul",
+                "duration_minutes": 60,
+                "participants": [
+                    {
+                        "name": "가람",
+                        "hard_blocks": [{"start": "2026-07-20T09:00", "end": "2026-07-20T10:00"}],
+                        "covers_time_window": False,
+                    },
+                    {"name": "나래", "covers_time_window": True},
+                ],
+            })
+            assert partial["status"] == "needs_input"
+            assert partial["missing_participants"] == []
+            assert all("가람" in candidate["unknown_participants"] for candidate in partial["candidates"])
+
+            invalid_initial = await call(session, "coordinate_schedule", {
+                "title": "범위 오류 회의",
+                "date_start": "2026-07-20",
+                "date_end": "2026-07-20",
+                "daily_start": "09:00",
+                "daily_end": "12:00",
+                "timezone": "Asia/Seoul",
+                "duration_minutes": 60,
+                "participants": [
+                    {
+                        "name": "가람",
+                        "hard_blocks": [{"start": "2026-07-19T09:00", "end": "2026-07-19T10:00"}],
+                    },
+                    {"name": "나래"},
+                ],
+            })
+            assert invalid_initial["status"] == "invalid_request"
+            assert invalid_initial["room_code"] is None
+
             blocked_room = await call(session, "coordinate_schedule", {
                 "title": "후보 없음 회의",
                 "date_start": "2026-07-20",
