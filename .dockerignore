@@ -1,0 +1,9 @@
+.git
+.venv
+**/.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.log
+*.db*
+mcp-server/smoke_test.py
