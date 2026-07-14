@@ -47,7 +47,7 @@ async def main() -> None:
             tools = await session.list_tools()
             names = {tool.name for tool in tools.tools}
             expected = {
-                "create_coordination_room",
+                "coordinate_schedule",
                 "submit_participant_preference",
                 "get_coordination_candidates",
             }
@@ -67,7 +67,7 @@ async def main() -> None:
                 print("PASS persisted room lookup")
                 return
 
-            created = await call(session, "create_coordination_room", {
+            created = await call(session, "coordinate_schedule", {
                 "title": "런칭 Go/No-Go 회의",
                 "date_start": "2026-07-20",
                 "date_end": "2026-07-24",
@@ -75,16 +75,45 @@ async def main() -> None:
                 "daily_end": "18:00",
                 "timezone": "Asia/Seoul",
                 "duration_minutes": 60,
+                "limit": 5,
                 "participants": [
-                    {"name": "지훈", "required": True},
-                    {"name": "서연", "required": True},
-                    {"name": "민수", "required": True},
-                    {"name": "하나", "required": True},
+                    {
+                        "name": "지훈",
+                        "required": True,
+                        "hard_blocks": [{"start": "2026-07-21T09:00", "end": "2026-07-21T12:00"}],
+                        "prefer": [{"start": "2026-07-22T13:00", "end": "2026-07-22T18:00"}],
+                        "covers_time_window": True,
+                    },
+                    {
+                        "name": "서연",
+                        "required": True,
+                        "avoid": [{"start": "2026-07-24T09:00", "end": "2026-07-24T18:00"}],
+                        "covers_time_window": True,
+                    },
+                    {
+                        "name": "민수",
+                        "required": True,
+                        "avoid": [{"start": "2026-07-23T09:00", "end": "2026-07-23T12:00"}],
+                        "covers_time_window": True,
+                    },
+                    {"name": "하나", "required": True, "covers_time_window": True},
                 ],
             })
             assert created["status"] == "ready"
             room_code = created["room_code"]
             assert len(room_code) >= 20
+            assert created["missing_participants"] == []
+            assert created["candidates"][0]["start"].startswith("2026-07-22T13:00")
+            assert all(candidate["fully_confirmed"] for candidate in created["candidates"])
+            assert all(
+                not candidate["start"].startswith("2026-07-21T09:")
+                and not candidate["start"].startswith("2026-07-21T10:")
+                and not candidate["start"].startswith("2026-07-21T11:")
+                for candidate in created["candidates"]
+            )
+            created_text = json.dumps(created, ensure_ascii=False)
+            assert "hard_blocks" not in created_text
+            assert "2026-07-21T12:00" not in created_text
 
             missing_room = await call(session, "get_coordination_candidates", {
                 "room_code": "this-room-code-does-not-exist",
@@ -93,16 +122,6 @@ async def main() -> None:
             assert missing_room["status"] == "not_found"
             assert room_code not in json.dumps(missing_room, ensure_ascii=False)
 
-            first = await submit(
-                session,
-                room_code,
-                "지훈",
-                hard_blocks=[{"start": "2026-07-21T09:00", "end": "2026-07-21T12:00"}],
-                prefer=[{"start": "2026-07-22T13:00", "end": "2026-07-22T18:00"}],
-            )
-            assert first["status"] == "recorded"
-            assert first["submitted_count"] == 1
-
             invalid = await submit(
                 session,
                 room_code,
@@ -110,45 +129,6 @@ async def main() -> None:
                 hard_blocks=[{"start": "2026-07-19T09:00", "end": "2026-07-19T12:00"}],
             )
             assert invalid["status"] == "invalid_request"
-
-            provisional = await call(session, "get_coordination_candidates", {
-                "room_code": room_code,
-                "limit": 2,
-            })
-            assert provisional["status"] == "needs_input"
-            assert provisional["missing_participants"] == ["서연", "민수", "하나"]
-            assert all(not candidate["fully_confirmed"] for candidate in provisional["candidates"])
-
-            unknown_submission = await submit(
-                session,
-                room_code,
-                "서연",
-                covers_time_window=False,
-            )
-            assert unknown_submission["status"] == "recorded"
-            unknown_result = await call(session, "get_coordination_candidates", {
-                "room_code": room_code,
-                "limit": 2,
-            })
-            assert unknown_result["status"] == "needs_input"
-            assert unknown_result["missing_participants"] == ["민수", "하나"]
-            assert all("서연" in candidate["unknown_participants"] for candidate in unknown_result["candidates"])
-
-            await submit(
-                session,
-                room_code,
-                "서연",
-                avoid=[{"start": "2026-07-24T09:00", "end": "2026-07-24T18:00"}],
-            )
-            await submit(
-                session,
-                room_code,
-                "민수",
-                avoid=[{"start": "2026-07-23T09:00", "end": "2026-07-23T12:00"}],
-            )
-            complete = await submit(session, room_code, "하나")
-            assert complete["submitted_count"] == 4
-            assert complete["remaining_participants"] == []
 
             # Re-submission replaces one participant's snapshot instead of duplicating it.
             repeated = await submit(
@@ -179,7 +159,35 @@ async def main() -> None:
             assert "hard_blocks" not in result_text
             assert "2026-07-21T12:00" not in result_text
 
-            blocked_room = await call(session, "create_coordination_room", {
+            incomplete = await call(session, "coordinate_schedule", {
+                "title": "추가 확인이 필요한 회의",
+                "date_start": "2026-07-20",
+                "date_end": "2026-07-20",
+                "daily_start": "09:00",
+                "daily_end": "12:00",
+                "timezone": "Asia/Seoul",
+                "duration_minutes": 60,
+                "participants": [
+                    {
+                        "name": "가람",
+                        "hard_blocks": [{"start": "2026-07-20T09:00", "end": "2026-07-20T10:00"}],
+                        "covers_time_window": True,
+                    },
+                    {"name": "나래"},
+                ],
+            })
+            assert incomplete["status"] == "needs_input"
+            assert incomplete["missing_participants"] == ["나래"]
+            assert all("나래" in candidate["unknown_participants"] for candidate in incomplete["candidates"])
+            completed = await submit(session, incomplete["room_code"], "나래")
+            assert completed["remaining_participants"] == []
+            completed_result = await call(session, "get_coordination_candidates", {
+                "room_code": incomplete["room_code"],
+                "limit": 2,
+            })
+            assert completed_result["status"] == "ready"
+
+            blocked_room = await call(session, "coordinate_schedule", {
                 "title": "후보 없음 회의",
                 "date_start": "2026-07-20",
                 "date_end": "2026-07-20",
@@ -188,24 +196,17 @@ async def main() -> None:
                 "timezone": "Asia/Seoul",
                 "duration_minutes": 60,
                 "participants": [
-                    {"name": "가람", "required": True},
-                    {"name": "나래", "required": True},
+                    {
+                        "name": "가람",
+                        "required": True,
+                        "hard_blocks": [{"start": "2026-07-20T09:00", "end": "2026-07-20T10:00"}],
+                        "covers_time_window": True,
+                    },
+                    {"name": "나래", "required": True, "covers_time_window": True},
                 ],
             })
-            blocked_code = blocked_room["room_code"]
-            await submit(
-                session,
-                blocked_code,
-                "가람",
-                hard_blocks=[{"start": "2026-07-20T09:00", "end": "2026-07-20T10:00"}],
-            )
-            await submit(session, blocked_code, "나래")
-            blocked = await call(session, "get_coordination_candidates", {
-                "room_code": blocked_code,
-                "limit": 2,
-            })
-            assert blocked["status"] == "blocked"
-            assert blocked["candidates"] == []
+            assert blocked_room["status"] == "blocked"
+            assert blocked_room["candidates"] == []
 
             print("PASS submission coordination smoke test")
             print(f"room_code={room_code}")

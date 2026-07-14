@@ -1,4 +1,4 @@
-"""PlayMCP submission server for participant-driven preference coordination."""
+"""PlayMCP submission server for conversation-first preference coordination."""
 
 from __future__ import annotations
 
@@ -37,14 +37,49 @@ async def health_check(request):  # noqa: ANN001
         )
 
 
+class TimeIntervalInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    start: str = Field(..., description="구간 시작 ISO 8601. 예: 2026-07-15T09:00")
+    end: str = Field(..., description="구간 종료 ISO 8601. 예: 2026-07-15T12:00")
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> "TimeIntervalInput":
+        if _parse_datetime(self.end) <= _parse_datetime(self.start):
+            raise ValueError("구간 end는 start보다 뒤여야 합니다.")
+        return self
+
+
 class ParticipantInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     name: str = Field(..., description="참여자 이름", min_length=1, max_length=50)
     required: bool = Field(default=True, description="필수 참석 여부")
+    hard_blocks: list[TimeIntervalInput] = Field(
+        default_factory=list,
+        description="현재 대화에서 확인된 절대 참석 불가 구간",
+        max_length=100,
+    )
+    avoid: list[TimeIntervalInput] = Field(
+        default_factory=list,
+        description="현재 대화에서 확인된 가능하지만 피하고 싶은 구간",
+        max_length=100,
+    )
+    prefer: list[TimeIntervalInput] = Field(
+        default_factory=list,
+        description="현재 대화에서 확인된 선호 구간",
+        max_length=100,
+    )
+    covers_time_window: bool = Field(
+        default=False,
+        description=(
+            "true는 이 참여자의 입력이 전체 후보 범위를 다루며 hard block 외 시간은 "
+            "가능하다고 확인된 경우에만 사용"
+        ),
+    )
 
 
-class CreateRoomInput(BaseModel):
+class CoordinateScheduleInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     title: str = Field(..., description="회의 또는 모임 이름", min_length=1, max_length=100)
@@ -56,13 +91,14 @@ class CreateRoomInput(BaseModel):
     duration_minutes: int = Field(default=60, description="회의 길이(분)", ge=15, le=480)
     participants: list[ParticipantInput] = Field(
         ...,
-        description="조율에 참여할 사람",
+        description="참여자와 현재 대화에서 확인된 각 참여자의 일정 조건",
         min_length=2,
         max_length=20,
     )
+    limit: int = Field(default=3, description="즉시 반환할 후보 수", ge=1, le=5)
 
     @model_validator(mode="after")
-    def validate_window(self) -> "CreateRoomInput":
+    def validate_window(self) -> "CoordinateScheduleInput":
         start_date = _parse_date(self.date_start)
         end_date = _parse_date(self.date_end)
         start_clock = _parse_clock(self.daily_start)
@@ -80,19 +116,6 @@ class CreateRoomInput(BaseModel):
         names = [participant.name.casefold() for participant in self.participants]
         if len(names) != len(set(names)):
             raise ValueError("참여자 이름은 중복될 수 없습니다.")
-        return self
-
-
-class TimeIntervalInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    start: str = Field(..., description="구간 시작 ISO 8601. 예: 2026-07-15T09:00")
-    end: str = Field(..., description="구간 종료 ISO 8601. 예: 2026-07-15T12:00")
-
-    @model_validator(mode="after")
-    def validate_interval(self) -> "TimeIntervalInput":
-        if _parse_datetime(self.end) <= _parse_datetime(self.start):
-            raise ValueError("구간 end는 start보다 뒤여야 합니다.")
         return self
 
 
@@ -134,16 +157,6 @@ class RoomParticipant(BaseModel):
     required: bool
 
 
-class CreateRoomOutput(BaseModel):
-    status: Literal["ready", "invalid_request", "internal_error"]
-    room_code: str | None = None
-    title: str | None = None
-    expires_at: str | None = None
-    participants: list[RoomParticipant] = Field(default_factory=list)
-    share_message: str
-    next_step: str
-
-
 class SubmitPreferenceOutput(BaseModel):
     status: Literal["recorded", "not_found", "participant_not_found", "invalid_request", "internal_error"]
     participant: str | None = None
@@ -163,6 +176,21 @@ class MeetingCandidate(BaseModel):
     prefer_count: int
     unknown_participants: list[str]
     reason: str
+
+
+class CoordinateScheduleOutput(BaseModel):
+    status: Literal["ready", "needs_input", "blocked", "invalid_request", "internal_error"]
+    room_code: str | None = None
+    title: str | None = None
+    expires_at: str | None = None
+    participants: list[RoomParticipant] = Field(default_factory=list)
+    candidates: list[MeetingCandidate] = Field(default_factory=list)
+    submitted_participants: list[str] = Field(default_factory=list)
+    missing_participants: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    share_message: str
+    message: str
 
 
 class CandidateOutput(BaseModel):
@@ -283,6 +311,23 @@ def _normalize_interval(interval: TimeIntervalInput, room: dict) -> dict:
     return {"start": start.isoformat(timespec="minutes"), "end": end.isoformat(timespec="minutes")}
 
 
+def _normalize_submission(
+    room: dict,
+    *,
+    covers_time_window: bool,
+    hard_blocks: list[TimeIntervalInput],
+    avoid: list[TimeIntervalInput],
+    prefer: list[TimeIntervalInput],
+) -> dict:
+    return {
+        "covers_time_window": covers_time_window,
+        "hard_blocks": [_normalize_interval(item, room) for item in hard_blocks],
+        "avoid": [_normalize_interval(item, room) for item in avoid],
+        "prefer": [_normalize_interval(item, room) for item in prefer],
+        "submitted_at": _utc_now().isoformat(),
+    }
+
+
 def _overlaps(start: datetime, end: datetime, interval: dict) -> bool:
     interval_start = _parse_datetime(interval["start"])
     interval_end = _parse_datetime(interval["end"])
@@ -374,18 +419,60 @@ def _rank_candidates(room: dict, limit: int) -> list[MeetingCandidate]:
     return [candidate for _, candidate in ranked[:limit]]
 
 
+def _build_candidate_output(room: dict, limit: int) -> CandidateOutput:
+    submitted_ids = set(room["submissions"])
+    submitted = [item["name"] for item in room["participants"] if item["id"] in submitted_ids]
+    missing = [item["name"] for item in room["participants"] if item["id"] not in submitted_ids]
+    candidates = _rank_candidates(room, limit)
+    if not candidates:
+        return CandidateOutput(
+            status="blocked",
+            title=room["title"],
+            submitted_participants=submitted,
+            missing_participants=missing,
+            risks=["현재 제출된 hard block을 모두 지키는 후보가 없습니다."],
+            message="후보 범위를 넓히거나 참여자가 자신의 절대 불가 조건을 다시 확인해야 합니다.",
+        )
+
+    status: Literal["ready", "needs_input"] = "needs_input" if missing or any(
+        candidate.unknown_participants for candidate in candidates
+    ) else "ready"
+    risks = []
+    if missing:
+        risks.append(f"아직 일정 정보가 없는 참여자: {', '.join(missing)}")
+    if any(candidate.unknown_participants for candidate in candidates):
+        risks.append("일부 참여자는 전체 후보 범위의 가능 여부가 확인되지 않았습니다.")
+    return CandidateOutput(
+        status=status,
+        title=room["title"],
+        candidates=candidates,
+        submitted_participants=submitted,
+        missing_participants=missing,
+        assumptions=[
+            "Agent가 Tool 입력으로 전달한 시간만 사용했으며 임의의 채팅방이나 외부 캘린더를 조회하지 않았습니다.",
+            "후보는 30분 간격으로 계산했습니다.",
+        ],
+        risks=risks,
+        message="확정 전 모든 필수 참여자에게 최종 후보를 다시 확인하세요.",
+    )
+
+
 @mcp.tool(
-    name="create_coordination_room",
+    name="coordinate_schedule",
     annotations={
-        "title": "조율방 만들기",
+        "title": "대화 조건으로 일정 조율",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": False,
     },
 )
-async def create_coordination_room(params: CreateRoomInput) -> CreateRoomOutput:
-    """회의 후보 범위와 참여자를 등록하고 공유할 조율방 코드를 만든다."""
+async def coordinate_schedule(params: CoordinateScheduleInput) -> CoordinateScheduleOutput:
+    """현재 AI 대화에서 확인된 여러 참여자의 조건을 한 번에 저장하고 후보를 계산한다.
+
+    임의의 카카오톡 방을 읽지 않는다. Agent가 현재 대화에 제공된 참여자별 조건을
+    구조화해 전달하며, 조건이 없는 참여자는 이름만 넣어 후속 확인 대상으로 남긴다.
+    """
     now = _utc_now()
     expires_at = now + timedelta(days=ROOM_TTL_DAYS)
     room_code = _room_code()
@@ -408,6 +495,30 @@ async def create_coordination_room(params: CreateRoomInput) -> CreateRoomOutput:
         "created_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
     }
+
+    try:
+        for participant_input, participant in zip(params.participants, participants, strict=True):
+            has_initial_response = bool(
+                participant_input.covers_time_window
+                or participant_input.hard_blocks
+                or participant_input.avoid
+                or participant_input.prefer
+            )
+            if has_initial_response:
+                room["submissions"][participant["id"]] = _normalize_submission(
+                    room,
+                    covers_time_window=participant_input.covers_time_window,
+                    hard_blocks=participant_input.hard_blocks,
+                    avoid=participant_input.avoid,
+                    prefer=participant_input.prefer,
+                )
+    except ValueError as exc:
+        return CoordinateScheduleOutput(
+            status="invalid_request",
+            share_message="조율을 시작하지 못했습니다.",
+            message=str(exc),
+        )
+
     try:
         with _connect() as connection:
             _delete_expired(connection)
@@ -416,23 +527,33 @@ async def create_coordination_room(params: CreateRoomInput) -> CreateRoomOutput:
                 (room_code, json.dumps(room, ensure_ascii=False), now.isoformat(), expires_at.isoformat()),
             )
     except sqlite3.Error:
-        return CreateRoomOutput(
+        return CoordinateScheduleOutput(
             status="internal_error",
             share_message="조율방을 저장하지 못했습니다.",
-            next_step="잠시 후 다시 시도해 주세요.",
+            message="잠시 후 다시 시도해 주세요.",
         )
 
-    return CreateRoomOutput(
-        status="ready",
+    snapshot = _build_candidate_output(room, params.limit)
+    missing_text = ", ".join(snapshot.missing_participants)
+    share_message = (
+        f"조율 코드 {room_code}\n{missing_text}님의 일정 조건을 알려주세요. "
+        "이 코드와 함께 불가·회피·선호 시간을 말하면 후보가 갱신됩니다."
+        if snapshot.missing_participants
+        else f"조율 코드 {room_code}\n후속 변경이 있으면 이 코드와 함께 새 조건을 제출해 주세요."
+    )
+    return CoordinateScheduleOutput(
+        status=snapshot.status,
         room_code=room_code,
         title=params.title,
         expires_at=expires_at.isoformat(),
         participants=[RoomParticipant(**participant) for participant in participants],
-        share_message=(
-            f"조율 코드 {room_code}\n각 참여자는 일정 조율 비서에서 이 코드와 함께 "
-            "불가 시간, 피하고 싶은 시간, 선호 시간을 말해 주세요."
-        ),
-        next_step="참여자들이 제출한 뒤 get_coordination_candidates로 후보를 확인하세요.",
+        candidates=snapshot.candidates,
+        submitted_participants=snapshot.submitted_participants,
+        missing_participants=snapshot.missing_participants,
+        assumptions=snapshot.assumptions,
+        risks=snapshot.risks,
+        share_message=share_message,
+        message=snapshot.message,
     )
 
 
@@ -466,13 +587,13 @@ async def submit_participant_preference(params: SubmitPreferenceInput) -> Submit
                 )
 
             try:
-                submission = {
-                    "covers_time_window": params.covers_time_window,
-                    "hard_blocks": [_normalize_interval(item, room) for item in params.hard_blocks],
-                    "avoid": [_normalize_interval(item, room) for item in params.avoid],
-                    "prefer": [_normalize_interval(item, room) for item in params.prefer],
-                    "submitted_at": _utc_now().isoformat(),
-                }
+                submission = _normalize_submission(
+                    room,
+                    covers_time_window=params.covers_time_window,
+                    hard_blocks=params.hard_blocks,
+                    avoid=params.avoid,
+                    prefer=params.prefer,
+                )
             except ValueError as exc:
                 return SubmitPreferenceOutput(status="invalid_request", message=str(exc))
 
@@ -517,41 +638,7 @@ async def get_coordination_candidates(params: GetCandidatesInput) -> CandidateOu
     except sqlite3.Error:
         return CandidateOutput(status="internal_error", message="조율 결과를 불러오지 못했습니다.")
 
-    submitted_ids = set(room["submissions"])
-    submitted = [item["name"] for item in room["participants"] if item["id"] in submitted_ids]
-    missing = [item["name"] for item in room["participants"] if item["id"] not in submitted_ids]
-    candidates = _rank_candidates(room, params.limit)
-    if not candidates:
-        return CandidateOutput(
-            status="blocked",
-            title=room["title"],
-            submitted_participants=submitted,
-            missing_participants=missing,
-            risks=["현재 제출된 hard block을 모두 지키는 후보가 없습니다."],
-            message="후보 범위를 넓히거나 참여자가 자신의 절대 불가 조건을 다시 확인해야 합니다.",
-        )
-
-    status: Literal["ready", "needs_input"] = "needs_input" if missing or any(
-        candidate.unknown_participants for candidate in candidates
-    ) else "ready"
-    risks = []
-    if missing:
-        risks.append(f"아직 응답하지 않은 참여자: {', '.join(missing)}")
-    if any(candidate.unknown_participants for candidate in candidates):
-        risks.append("일부 참여자가 후보 범위의 나머지 시간을 가능하다고 확인하지 않았습니다.")
-    return CandidateOutput(
-        status=status,
-        title=room["title"],
-        candidates=candidates,
-        submitted_participants=submitted,
-        missing_participants=missing,
-        assumptions=[
-            "입력된 시간만 사용했으며 실제 Google/Outlook 캘린더를 조회하지 않았습니다.",
-            "후보는 30분 간격으로 계산했습니다.",
-        ],
-        risks=risks,
-        message="확정 전 모든 필수 참여자에게 최종 후보를 다시 확인하세요.",
-    )
+    return _build_candidate_output(room, params.limit)
 
 
 if __name__ == "__main__":
