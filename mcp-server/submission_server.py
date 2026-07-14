@@ -6,20 +6,26 @@ import json
 import os
 import secrets
 import sqlite3
+from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Iterator, Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 mcp = FastMCP("preference_coordination_mcp", stateless_http=True, json_response=True)
 DB_PATH = Path(os.getenv("COORDINATION_DB_PATH", "/data/coordination.db"))
 ROOM_TTL_DAYS = int(os.getenv("COORDINATION_ROOM_TTL_DAYS", "7"))
+MAX_ACTIVE_ROOMS = int(os.getenv("COORDINATION_MAX_ACTIVE_ROOMS", "5000"))
+MAX_CREATES_PER_MINUTE = int(os.getenv("COORDINATION_MAX_CREATES_PER_MINUTE", "60"))
+SEOUL = ZoneInfo("Asia/Seoul")
+_CREATE_TIMES: deque[float] = deque()
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -40,8 +46,20 @@ async def health_check(request):  # noqa: ANN001
 class TimeIntervalInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    start: str = Field(..., description="구간 시작 ISO 8601. 예: 2026-07-15T09:00")
-    end: str = Field(..., description="구간 종료 ISO 8601. 예: 2026-07-15T12:00")
+    start: str = Field(
+        ...,
+        description="Asia/Seoul 기준 구간 시작 YYYY-MM-DDTHH:MM",
+        min_length=16,
+        max_length=16,
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$",
+    )
+    end: str = Field(
+        ...,
+        description="Asia/Seoul 기준 구간 종료 YYYY-MM-DDTHH:MM",
+        min_length=16,
+        max_length=16,
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$",
+    )
 
     @model_validator(mode="after")
     def validate_interval(self) -> "TimeIntervalInput":
@@ -54,21 +72,20 @@ class ParticipantInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     name: str = Field(..., description="참여자 이름", min_length=1, max_length=50)
-    required: bool = Field(default=True, description="필수 참석 여부")
     hard_blocks: list[TimeIntervalInput] = Field(
         default_factory=list,
         description="현재 대화에서 확인된 절대 참석 불가 구간",
-        max_length=100,
+        max_length=30,
     )
     avoid: list[TimeIntervalInput] = Field(
         default_factory=list,
         description="현재 대화에서 확인된 가능하지만 피하고 싶은 구간",
-        max_length=100,
+        max_length=30,
     )
     prefer: list[TimeIntervalInput] = Field(
         default_factory=list,
         description="현재 대화에서 확인된 선호 구간",
-        max_length=100,
+        max_length=30,
     )
     covers_time_window: bool = Field(
         default=False,
@@ -83,19 +100,42 @@ class CoordinateScheduleInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     title: str = Field(..., description="회의 또는 모임 이름", min_length=1, max_length=100)
-    date_start: str = Field(..., description="후보 시작 날짜 YYYY-MM-DD")
-    date_end: str = Field(..., description="후보 종료 날짜 YYYY-MM-DD")
-    daily_start: str = Field(default="09:00", description="매일 후보 시작 시각 HH:MM")
-    daily_end: str = Field(default="18:00", description="매일 후보 종료 시각 HH:MM")
-    timezone: str = Field(default="Asia/Seoul", description="IANA timezone")
+    date_start: str = Field(
+        ...,
+        description="후보 시작 날짜 YYYY-MM-DD",
+        min_length=10,
+        max_length=10,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    date_end: str = Field(
+        ...,
+        description="후보 종료 날짜 YYYY-MM-DD",
+        min_length=10,
+        max_length=10,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    daily_start: str = Field(
+        default="09:00",
+        description="매일 후보 시작 시각 HH:MM",
+        min_length=5,
+        max_length=5,
+        pattern=r"^\d{2}:\d{2}$",
+    )
+    daily_end: str = Field(
+        default="18:00",
+        description="매일 후보 종료 시각 HH:MM",
+        min_length=5,
+        max_length=5,
+        pattern=r"^\d{2}:\d{2}$",
+    )
     duration_minutes: int = Field(default=60, description="회의 길이(분)", ge=15, le=480)
     participants: list[ParticipantInput] = Field(
         ...,
         description="참여자와 현재 대화에서 확인된 각 참여자의 일정 조건",
         min_length=2,
-        max_length=20,
+        max_length=12,
     )
-    limit: int = Field(default=3, description="즉시 반환할 후보 수", ge=1, le=5)
+    limit: int = Field(default=3, description="즉시 반환할 후보 수", ge=1, le=3)
 
     @model_validator(mode="after")
     def validate_window(self) -> "CoordinateScheduleInput":
@@ -105,14 +145,15 @@ class CoordinateScheduleInput(BaseModel):
         end_clock = _parse_clock(self.daily_end)
         if end_date < start_date:
             raise ValueError("date_end는 date_start와 같거나 뒤여야 합니다.")
-        if (end_date - start_date).days > 31:
-            raise ValueError("후보 날짜 범위는 최대 31일입니다.")
+        if (end_date - start_date).days >= 14:
+            raise ValueError("후보 날짜 범위는 최대 14일입니다.")
         if end_clock <= start_clock:
             raise ValueError("daily_end는 daily_start보다 뒤여야 합니다.")
-        try:
-            ZoneInfo(self.timezone)
-        except ZoneInfoNotFoundError as exc:
-            raise ValueError("유효한 IANA timezone을 입력하세요.") from exc
+        window_minutes = (
+            datetime.combine(date.min, end_clock) - datetime.combine(date.min, start_clock)
+        ).seconds // 60
+        if self.duration_minutes > window_minutes:
+            raise ValueError("회의 길이는 일일 후보 시간 범위보다 길 수 없습니다.")
         names = [participant.name.casefold() for participant in self.participants]
         if len(names) != len(set(names)):
             raise ValueError("참여자 이름은 중복될 수 없습니다.")
@@ -122,22 +163,27 @@ class CoordinateScheduleInput(BaseModel):
 class SubmitPreferenceInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    room_code: str = Field(..., description="조율방 생성 시 받은 공유 코드", min_length=20, max_length=64)
+    coordination_id: str = Field(
+        ...,
+        description="이전 coordinate_schedule 결과의 내부 coordination_id. Agent가 같은 대화에서 재사용",
+        min_length=20,
+        max_length=64,
+    )
     participant: str = Field(..., description="조건을 제출하는 참여자 이름", min_length=1, max_length=50)
     hard_blocks: list[TimeIntervalInput] = Field(
         default_factory=list,
         description="절대 참석할 수 없는 시간 구간",
-        max_length=100,
+        max_length=30,
     )
     avoid: list[TimeIntervalInput] = Field(
         default_factory=list,
         description="가능하지만 피하고 싶은 시간 구간",
-        max_length=100,
+        max_length=30,
     )
     prefer: list[TimeIntervalInput] = Field(
         default_factory=list,
         description="선호하는 시간 구간",
-        max_length=100,
+        max_length=30,
     )
     covers_time_window: bool = Field(
         ...,
@@ -148,13 +194,17 @@ class SubmitPreferenceInput(BaseModel):
 class GetCandidatesInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    room_code: str = Field(..., description="조율방 공유 코드", min_length=20, max_length=64)
-    limit: int = Field(default=2, description="반환할 후보 수", ge=1, le=5)
+    coordination_id: str = Field(
+        ...,
+        description="이전 coordinate_schedule 결과의 내부 coordination_id. Agent가 같은 대화에서 재사용",
+        min_length=20,
+        max_length=64,
+    )
+    limit: int = Field(default=3, description="반환할 후보 수", ge=1, le=3)
 
 
 class RoomParticipant(BaseModel):
     name: str
-    required: bool
 
 
 class SubmitPreferenceOutput(BaseModel):
@@ -171,7 +221,7 @@ class MeetingCandidate(BaseModel):
     end: str
     fully_confirmed: bool
     available_count: int
-    required_count: int
+    participant_count: int
     avoid_count: int
     prefer_count: int
     unknown_participants: list[str]
@@ -179,8 +229,19 @@ class MeetingCandidate(BaseModel):
 
 
 class CoordinateScheduleOutput(BaseModel):
-    status: Literal["ready", "needs_input", "blocked", "invalid_request", "internal_error"]
-    room_code: str | None = None
+    status: Literal[
+        "ready",
+        "needs_input",
+        "blocked",
+        "invalid_request",
+        "rate_limited",
+        "capacity_reached",
+        "internal_error",
+    ]
+    coordination_id: str | None = Field(
+        default=None,
+        description="후속 Tool 호출용 내부 상태 ID. Agent가 같은 AI 대화에서 보관하고 재사용",
+    )
     title: str | None = None
     expires_at: str | None = None
     participants: list[RoomParticipant] = Field(default_factory=list)
@@ -232,8 +293,19 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _room_code() -> str:
+def _coordination_id() -> str:
     return secrets.token_urlsafe(18)
+
+
+def _allow_room_creation() -> bool:
+    now = monotonic()
+    cutoff = now - 60
+    while _CREATE_TIMES and _CREATE_TIMES[0] <= cutoff:
+        _CREATE_TIMES.popleft()
+    if len(_CREATE_TIMES) >= MAX_CREATES_PER_MINUTE:
+        return False
+    _CREATE_TIMES.append(now)
+    return True
 
 
 def _initialize_db() -> None:
@@ -243,19 +315,22 @@ def _initialize_db() -> None:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS coordination_rooms (
-                room_code TEXT PRIMARY KEY,
+                coordination_id TEXT PRIMARY KEY,
                 state_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
             )
             """
         )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_coordination_rooms_expires_at "
+            "ON coordination_rooms(expires_at)"
+        )
 
 
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
-    _initialize_db()
-    connection = sqlite3.connect(DB_PATH, timeout=5)
+    connection = sqlite3.connect(DB_PATH, timeout=1)
     connection.row_factory = sqlite3.Row
     try:
         yield connection
@@ -274,32 +349,30 @@ def _delete_expired(connection: sqlite3.Connection) -> None:
     )
 
 
-def _load_room(connection: sqlite3.Connection, room_code: str) -> dict | None:
-    _delete_expired(connection)
+def _load_room(connection: sqlite3.Connection, coordination_id: str) -> dict | None:
     row = connection.execute(
-        "SELECT state_json FROM coordination_rooms WHERE room_code = ?",
-        (room_code,),
+        "SELECT state_json FROM coordination_rooms WHERE coordination_id = ? AND expires_at > ?",
+        (coordination_id, _utc_now().isoformat()),
     ).fetchone()
     return json.loads(row["state_json"]) if row else None
 
 
 def _normalize_interval(interval: TimeIntervalInput, room: dict) -> dict:
-    zone = ZoneInfo(room["timezone"])
     room_start = datetime.combine(
         _parse_date(room["date_start"]),
         _parse_clock(room["daily_start"]),
-        zone,
+        SEOUL,
     )
     room_end = datetime.combine(
         _parse_date(room["date_end"]),
         _parse_clock(room["daily_end"]),
-        zone,
+        SEOUL,
     )
 
     start = _parse_datetime(interval.start)
     end = _parse_datetime(interval.end)
-    start = start.replace(tzinfo=zone) if start.tzinfo is None else start.astimezone(zone)
-    end = end.replace(tzinfo=zone) if end.tzinfo is None else end.astimezone(zone)
+    start = start.replace(tzinfo=SEOUL)
+    end = end.replace(tzinfo=SEOUL)
     if start < room_start or end > room_end or end <= start:
         raise ValueError("선호 구간은 조율방 후보 범위 안에 있어야 합니다.")
     if start.date() != end.date():
@@ -341,7 +414,6 @@ def _contains(interval: dict, start: datetime, end: datetime) -> bool:
 
 
 def _candidate_slots(room: dict) -> list[tuple[datetime, datetime]]:
-    zone = ZoneInfo(room["timezone"])
     start_date = _parse_date(room["date_start"])
     end_date = _parse_date(room["date_end"])
     daily_start = _parse_clock(room["daily_start"])
@@ -352,8 +424,8 @@ def _candidate_slots(room: dict) -> list[tuple[datetime, datetime]]:
 
     current_date = start_date
     while current_date <= end_date:
-        cursor = datetime.combine(current_date, daily_start, zone)
-        day_end = datetime.combine(current_date, daily_end, zone)
+        cursor = datetime.combine(current_date, daily_start, SEOUL)
+        day_end = datetime.combine(current_date, daily_end, SEOUL)
         while cursor + duration <= day_end:
             slots.append((cursor, cursor + duration))
             cursor += step
@@ -362,7 +434,7 @@ def _candidate_slots(room: dict) -> list[tuple[datetime, datetime]]:
 
 
 def _rank_candidates(room: dict, limit: int) -> list[MeetingCandidate]:
-    required = [participant for participant in room["participants"] if participant["required"]]
+    participants = room["participants"]
     submissions = room["submissions"]
     ranked: list[tuple[tuple, MeetingCandidate]] = []
 
@@ -373,7 +445,7 @@ def _rank_candidates(room: dict, limit: int) -> list[MeetingCandidate]:
         prefer_count = 0
         unknown: list[str] = []
 
-        for participant in required:
+        for participant in participants:
             submission = submissions.get(participant["id"])
             if submission is None:
                 unknown.append(participant["name"])
@@ -381,20 +453,22 @@ def _rank_candidates(room: dict, limit: int) -> list[MeetingCandidate]:
             if any(_overlaps(start, end, interval) for interval in submission["hard_blocks"]):
                 hard_conflict = True
                 break
-            if submission["covers_time_window"]:
+            is_avoid = any(_overlaps(start, end, interval) for interval in submission["avoid"])
+            is_prefer = any(_contains(interval, start, end) for interval in submission["prefer"])
+            if submission["covers_time_window"] or is_avoid or is_prefer:
                 available_count += 1
             else:
                 unknown.append(participant["name"])
-            if any(_contains(interval, start, end) for interval in submission["avoid"]):
+            if is_avoid:
                 avoid_count += 1
-            if any(_contains(interval, start, end) for interval in submission["prefer"]):
+            if is_prefer:
                 prefer_count += 1
 
         if hard_conflict:
             continue
 
-        fully_confirmed = available_count == len(required) and not unknown
-        reason_parts = [f"가능 확인 {available_count}/{len(required)}"]
+        fully_confirmed = available_count == len(participants) and not unknown
+        reason_parts = [f"가능 확인 {available_count}/{len(participants)}"]
         if avoid_count:
             reason_parts.append(f"회피 {avoid_count}명")
         if prefer_count:
@@ -406,7 +480,7 @@ def _rank_candidates(room: dict, limit: int) -> list[MeetingCandidate]:
             end=end.isoformat(timespec="minutes"),
             fully_confirmed=fully_confirmed,
             available_count=available_count,
-            required_count=len(required),
+            participant_count=len(participants),
             avoid_count=avoid_count,
             prefer_count=prefer_count,
             unknown_participants=unknown,
@@ -473,22 +547,29 @@ async def coordinate_schedule(params: CoordinateScheduleInput) -> CoordinateSche
     임의의 카카오톡 방을 읽지 않는다. Agent가 현재 대화에 제공된 참여자별 조건을
     구조화해 전달하며, 조건이 없는 참여자는 이름만 넣어 후속 확인 대상으로 남긴다.
     """
+    if not _allow_room_creation():
+        return CoordinateScheduleOutput(
+            status="rate_limited",
+            share_message="잠시 후 다시 시도해 주세요.",
+            message="분당 조율 생성 한도를 초과했습니다.",
+        )
+
     now = _utc_now()
     expires_at = now + timedelta(days=ROOM_TTL_DAYS)
-    room_code = _room_code()
+    coordination_id = _coordination_id()
     participants = [
-        {"id": secrets.token_hex(16), "name": participant.name, "required": participant.required}
+        {"id": secrets.token_hex(16), "name": participant.name}
         for participant in params.participants
     ]
     room = {
-        "schema_version": 1,
-        "room_code": room_code,
+        "schema_version": 2,
+        "coordination_id": coordination_id,
         "title": params.title,
         "date_start": params.date_start,
         "date_end": params.date_end,
         "daily_start": params.daily_start,
         "daily_end": params.daily_end,
-        "timezone": params.timezone,
+        "timezone": "Asia/Seoul",
         "duration_minutes": params.duration_minutes,
         "participants": participants,
         "submissions": {},
@@ -521,10 +602,22 @@ async def coordinate_schedule(params: CoordinateScheduleInput) -> CoordinateSche
 
     try:
         with _connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             _delete_expired(connection)
+            active_count = connection.execute(
+                "SELECT COUNT(*) FROM coordination_rooms WHERE expires_at > ?",
+                (now.isoformat(),),
+            ).fetchone()[0]
+            if active_count >= MAX_ACTIVE_ROOMS:
+                return CoordinateScheduleOutput(
+                    status="capacity_reached",
+                    share_message="새 조율을 저장할 수 없습니다.",
+                    message="활성 조율 저장 한도에 도달했습니다. 만료 후 다시 시도해 주세요.",
+                )
             connection.execute(
-                "INSERT INTO coordination_rooms(room_code, state_json, created_at, expires_at) VALUES (?, ?, ?, ?)",
-                (room_code, json.dumps(room, ensure_ascii=False), now.isoformat(), expires_at.isoformat()),
+                "INSERT INTO coordination_rooms(coordination_id, state_json, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (coordination_id, json.dumps(room, ensure_ascii=False), now.isoformat(), expires_at.isoformat()),
             )
     except sqlite3.Error:
         return CoordinateScheduleOutput(
@@ -536,14 +629,14 @@ async def coordinate_schedule(params: CoordinateScheduleInput) -> CoordinateSche
     snapshot = _build_candidate_output(room, params.limit)
     missing_text = ", ".join(snapshot.missing_participants)
     share_message = (
-        f"조율 코드 {room_code}\n{missing_text}님의 일정 조건을 알려주세요. "
-        "이 코드와 함께 불가·회피·선호 시간을 말하면 후보가 갱신됩니다."
+        f"{missing_text}님의 일정 정보가 더 필요합니다. "
+        "같은 AI 대화에서 추가 조건을 알려주면 후보가 갱신됩니다."
         if snapshot.missing_participants
-        else f"조율 코드 {room_code}\n후속 변경이 있으면 이 코드와 함께 새 조건을 제출해 주세요."
+        else "조율 상태를 저장했습니다. 같은 AI 대화에서 변경 사항을 말하면 후보가 갱신됩니다."
     )
     return CoordinateScheduleOutput(
         status=snapshot.status,
-        room_code=room_code,
+        coordination_id=coordination_id,
         title=params.title,
         expires_at=expires_at.isoformat(),
         participants=[RoomParticipant(**participant) for participant in participants],
@@ -568,11 +661,12 @@ async def coordinate_schedule(params: CoordinateScheduleInput) -> CoordinateSche
     },
 )
 async def submit_participant_preference(params: SubmitPreferenceInput) -> SubmitPreferenceOutput:
-    """조율방 참여자 한 명의 불가·회피·선호 구간을 등록하거나 교체한다."""
+    """이전 조율의 한 참여자 조건을 추가하거나 교체한다. Agent가 내부 ID를 재사용한다."""
     try:
         with _connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            room = _load_room(connection, params.room_code)
+            _delete_expired(connection)
+            room = _load_room(connection, params.coordination_id)
             if room is None:
                 return SubmitPreferenceOutput(status="not_found", message="조율방을 찾을 수 없거나 만료되었습니다.")
 
@@ -599,8 +693,8 @@ async def submit_participant_preference(params: SubmitPreferenceInput) -> Submit
 
             room["submissions"][participant["id"]] = submission
             connection.execute(
-                "UPDATE coordination_rooms SET state_json = ? WHERE room_code = ?",
-                (json.dumps(room, ensure_ascii=False), params.room_code),
+                "UPDATE coordination_rooms SET state_json = ? WHERE coordination_id = ?",
+                (json.dumps(room, ensure_ascii=False), params.coordination_id),
             )
             submitted_ids = set(room["submissions"])
             remaining = [item["name"] for item in room["participants"] if item["id"] not in submitted_ids]
@@ -629,10 +723,10 @@ async def submit_participant_preference(params: SubmitPreferenceInput) -> Submit
     },
 )
 async def get_coordination_candidates(params: GetCandidatesInput) -> CandidateOutput:
-    """제출된 조건을 집계해 hard block이 없는 회의 후보와 미응답자를 반환한다."""
+    """이전 조율의 최신 후보를 반환한다. Agent가 내부 ID를 재사용한다."""
     try:
         with _connect() as connection:
-            room = _load_room(connection, params.room_code)
+            room = _load_room(connection, params.coordination_id)
             if room is None:
                 return CandidateOutput(status="not_found", message="조율방을 찾을 수 없거나 만료되었습니다.")
     except sqlite3.Error:
