@@ -553,7 +553,7 @@ async def coordinate_schedule(
     duration_minutes: int = 60,
     limit: int = 3,
 ) -> CoordinateScheduleOutput:
-    """현재 AI 대화에서 확인된 여러 참여자의 조건을 한 번에 저장하고 후보를 계산한다.
+    """시간모아는 현재 AI 대화에서 확인된 여러 참여자의 조건을 저장하고 후보를 계산한다.
 
     임의의 카카오톡 방을 읽지 않는다. Agent가 현재 대화에 제공된 참여자별 조건을
     구조화해 전달하며, 조건이 없는 참여자는 이름만 넣어 후속 확인 대상으로 남긴다.
@@ -697,7 +697,7 @@ async def submit_participant_preference(
     avoid: list[TimeIntervalInput] | None = None,
     prefer: list[TimeIntervalInput] | None = None,
 ) -> SubmitPreferenceOutput:
-    """이전 조율의 한 참여자 조건을 추가하거나 교체한다. Agent가 내부 ID를 재사용한다."""
+    """시간모아에서 이전 조율의 한 참여자 조건을 추가하거나 교체한다. Agent가 내부 ID를 재사용한다."""
     try:
         params = SubmitPreferenceInput(
             coordination_id=coordination_id,
@@ -774,7 +774,7 @@ async def get_coordination_candidates(
     coordination_id: str,
     limit: int = 3,
 ) -> CandidateOutput:
-    """이전 조율의 최신 후보를 반환한다. Agent가 내부 ID를 재사용한다."""
+    """시간모아에서 이전 조율의 최신 후보를 반환한다. Agent가 내부 ID를 재사용한다."""
     try:
         params = GetCandidatesInput(coordination_id=coordination_id, limit=limit)
     except ValueError as exc:

@@ -63,6 +63,7 @@ async def main() -> None:
             if names != expected:
                 raise RuntimeError(f"Unexpected tool surface: {sorted(names)}")
             tools_by_name = {tool.name: tool for tool in tools.tools}
+            assert all("시간모아" in (tool.description or "") for tool in tools.tools)
             schema_text = json.dumps([tool.inputSchema for tool in tools.tools])
             assert "covers_time_window" in schema_text
             assert "hard_blocks" in schema_text
