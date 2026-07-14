@@ -20,9 +20,12 @@ AGENTIC PLAYER 10 예선 제출용 구현입니다.
 - `coordinate_schedule`: 여러 참여자의 현재 조건을 저장하고 즉시 후보와 내부 상태 ID 반환
 - `submit_participant_preference`: 참여자 한 명의 hard block, avoid, prefer 제출
 - `get_coordination_candidates`: 후보 시간, 집계 근거, 미응답·미확인 반환
+- `confirm_coordination`: 전원 확인된 후보를 확정하고 Google/Outlook 일정 추가 링크 반환
 
 모든 응답은 typed structured output입니다. 후보 계산은 hard block 제거, 가능 확인
 인원 최대화, avoid 인원 최소화, prefer 인원 최대화 순으로 결정됩니다.
+부분 조건만 제출한 참여자는 조건 밖 시간에 대해 미확인으로 유지되며, 전체 후보 범위의
+가능 여부가 확인된 후보만 확정할 수 있습니다. 확정 후 조건이 변경되면 기존 확정은 해제됩니다.
 
 ## 로컬 실행
 

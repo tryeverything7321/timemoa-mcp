@@ -421,9 +421,8 @@ def _normalize_submission(
     avoid: list[TimeIntervalInput],
     prefer: list[TimeIntervalInput],
 ) -> dict:
-    has_constraints = bool(hard_blocks or avoid or prefer)
     return {
-        "covers_time_window": covers_time_window or has_constraints,
+        "covers_time_window": covers_time_window,
         "hard_blocks": [_normalize_interval(item, room) for item in hard_blocks],
         "avoid": [_normalize_interval(item, room) for item in avoid],
         "prefer": [_normalize_interval(item, room) for item in prefer],
@@ -774,6 +773,7 @@ async def submit_participant_preference(
                 return SubmitPreferenceOutput(status="invalid_request", message=str(exc))
 
             room["submissions"][participant["id"]] = submission
+            confirmation_was_cleared = room.pop("confirmed_event", None) is not None
             connection.execute(
                 "UPDATE coordination_rooms SET state_json = ? WHERE coordination_id = ?",
                 (json.dumps(room, ensure_ascii=False), params.coordination_id),
@@ -787,7 +787,9 @@ async def submit_participant_preference(
                 total_count=len(room["participants"]),
                 remaining_participants=remaining,
                 message=(
-                    "조건을 저장했습니다. 같은 이름으로 다시 제출하면 이전 조건을 통째로 교체합니다."
+                    "조건을 저장하고 기존 확정을 해제했습니다. 최신 후보를 다시 확인하세요."
+                    if confirmation_was_cleared
+                    else "조건을 저장했습니다. 같은 이름으로 다시 제출하면 이전 조건을 통째로 교체합니다."
                 ),
             )
     except sqlite3.Error:

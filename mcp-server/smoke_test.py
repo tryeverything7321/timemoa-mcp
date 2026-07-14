@@ -260,6 +260,22 @@ async def main() -> None:
             })
             assert confirmed_result["confirmed_event"]["start"] == result["candidates"][0]["start"]
 
+            changed_after_confirmation = await submit(
+                session,
+                coordination_id,
+                "지훈",
+                hard_blocks=[{
+                    "start": result["candidates"][0]["start"][:16],
+                    "end": result["candidates"][0]["end"][:16],
+                }],
+            )
+            assert "기존 확정을 해제" in changed_after_confirmation["message"]
+            invalidated_result = await call(session, "get_coordination_candidates", {
+                "coordination_id": coordination_id,
+                "limit": 3,
+            })
+            assert invalidated_result["confirmed_event"] is None
+
             incomplete = await call(session, "coordinate_schedule", {
                 "title": "추가 확인이 필요한 회의",
                 "date_start": "2026-07-20",
@@ -303,9 +319,14 @@ async def main() -> None:
                     {"name": "나래", "covers_time_window": True},
                 ],
             })
-            assert partial["status"] == "ready"
+            assert partial["status"] == "needs_input"
             assert partial["missing_participants"] == []
-            assert all(not candidate["unknown_participants"] for candidate in partial["candidates"])
+            assert all("가람" in candidate["unknown_participants"] for candidate in partial["candidates"])
+            partial_confirmation = await call(session, "confirm_coordination", {
+                "coordination_id": partial["coordination_id"],
+                "chosen_start": partial["candidates"][0]["start"],
+            })
+            assert partial_confirmation["status"] == "needs_confirmation"
 
             invalid_initial = await call(session, "coordinate_schedule", {
                 "title": "범위 오류 회의",
