@@ -12,6 +12,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Iterator, Literal
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
@@ -203,6 +204,18 @@ class GetCandidatesInput(BaseModel):
     limit: int = Field(default=3, description="반환할 후보 수", ge=1, le=3)
 
 
+class ConfirmCoordinationInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    coordination_id: str = Field(..., min_length=20, max_length=64)
+    chosen_start: str = Field(
+        ...,
+        description="get_coordination_candidates가 반환한 후보 start 값",
+        min_length=16,
+        max_length=32,
+    )
+
+
 class RoomParticipant(BaseModel):
     name: str
 
@@ -226,6 +239,21 @@ class MeetingCandidate(BaseModel):
     prefer_count: int
     unknown_participants: list[str]
     reason: str
+
+
+class ConfirmedEvent(BaseModel):
+    title: str
+    start: str
+    end: str
+    timezone: str = "Asia/Seoul"
+
+
+class ConfirmCoordinationOutput(BaseModel):
+    status: Literal["confirmed", "not_found", "invalid_request", "needs_confirmation", "internal_error"]
+    event: ConfirmedEvent | None = None
+    google_calendar_url: str | None = None
+    outlook_calendar_url: str | None = None
+    message: str
 
 
 class CoordinateScheduleOutput(BaseModel):
@@ -262,6 +290,7 @@ class CandidateOutput(BaseModel):
     missing_participants: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
+    confirmed_event: ConfirmedEvent | None = None
     message: str
 
 
@@ -529,6 +558,11 @@ def _build_candidate_output(room: dict, limit: int) -> CandidateOutput:
             "후보는 30분 간격으로 계산했습니다.",
         ],
         risks=risks,
+        confirmed_event=(
+            ConfirmedEvent(**room["confirmed_event"])
+            if room.get("confirmed_event")
+            else None
+        ),
         message="확정 전 모든 필수 참여자에게 최종 후보를 다시 확인하세요.",
     )
 
@@ -789,6 +823,102 @@ async def get_coordination_candidates(
         return CandidateOutput(status="internal_error", message="조율 결과를 불러오지 못했습니다.")
 
     return _build_candidate_output(room, params.limit)
+
+
+@mcp.tool(
+    name="confirm_coordination",
+    annotations={
+        "title": "시간모아 후보 확정 및 캘린더 연결",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def confirm_coordination(
+    coordination_id: str,
+    chosen_start: str,
+) -> ConfirmCoordinationOutput:
+    """시간모아에서 전원 가능이 확인된 후보를 확정하고 캘린더 추가 링크를 만든다.
+
+    coordinate_schedule 또는 get_coordination_candidates가 반환한 후보의 start 값을
+    chosen_start로 사용한다. 미확인 참여자가 있거나 후보가 아닌 시간은 확정하지 않는다.
+    """
+    try:
+        params = ConfirmCoordinationInput(
+            coordination_id=coordination_id,
+            chosen_start=chosen_start,
+        )
+        chosen = _parse_datetime(params.chosen_start)
+        chosen = chosen.replace(tzinfo=SEOUL) if chosen.tzinfo is None else chosen.astimezone(SEOUL)
+    except ValueError as exc:
+        return ConfirmCoordinationOutput(status="invalid_request", message=str(exc))
+
+    try:
+        with _connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            _delete_expired(connection)
+            room = _load_room(connection, params.coordination_id)
+            if room is None:
+                return ConfirmCoordinationOutput(status="not_found", message="조율을 찾을 수 없거나 만료되었습니다.")
+
+            candidates = _rank_candidates(room, len(_candidate_slots(room)))
+            candidate = next(
+                (
+                    item for item in candidates
+                    if _parse_datetime(item.start).astimezone(SEOUL) == chosen
+                ),
+                None,
+            )
+            if candidate is None:
+                return ConfirmCoordinationOutput(
+                    status="invalid_request",
+                    message="시간모아가 반환한 후보 중 하나를 선택해 주세요.",
+                )
+            if not candidate.fully_confirmed:
+                return ConfirmCoordinationOutput(
+                    status="needs_confirmation",
+                    message="미확인 참여자가 있어 아직 확정할 수 없습니다.",
+                )
+
+            event = ConfirmedEvent(
+                title=room["title"],
+                start=candidate.start,
+                end=candidate.end,
+            )
+            room["confirmed_event"] = event.model_dump()
+            connection.execute(
+                "UPDATE coordination_rooms SET state_json = ? WHERE coordination_id = ?",
+                (json.dumps(room, ensure_ascii=False), params.coordination_id),
+            )
+    except sqlite3.Error:
+        return ConfirmCoordinationOutput(status="internal_error", message="일정을 확정하지 못했습니다.")
+
+    start = _parse_datetime(event.start)
+    end = _parse_datetime(event.end)
+    google_dates = (
+        f"{start.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}/"
+        f"{end.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    )
+    google_url = "https://calendar.google.com/calendar/render?" + urlencode({
+        "action": "TEMPLATE",
+        "text": event.title,
+        "dates": google_dates,
+        "details": "시간모아에서 참여자 조건을 조율해 확정한 일정입니다.",
+    })
+    outlook_url = "https://outlook.live.com/calendar/0/deeplink/compose?" + urlencode({
+        "subject": event.title,
+        "startdt": event.start,
+        "enddt": event.end,
+        "body": "시간모아에서 참여자 조건을 조율해 확정한 일정입니다.",
+    })
+    return ConfirmCoordinationOutput(
+        status="confirmed",
+        event=event,
+        google_calendar_url=google_url,
+        outlook_calendar_url=outlook_url,
+        message="시간모아가 후보를 확정했습니다. 원하는 캘린더 추가 화면을 여세요.",
+    )
 
 
 if __name__ == "__main__":

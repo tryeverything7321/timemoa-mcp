@@ -59,6 +59,7 @@ async def main() -> None:
                 "coordinate_schedule",
                 "submit_participant_preference",
                 "get_coordination_candidates",
+                "confirm_coordination",
             }
             if names != expected:
                 raise RuntimeError(f"Unexpected tool surface: {sorted(names)}")
@@ -244,6 +245,20 @@ async def main() -> None:
             result_text = json.dumps(result, ensure_ascii=False)
             assert "hard_blocks" not in result_text
             assert "2026-07-21T12:00" not in result_text
+
+            confirmed = await call(session, "confirm_coordination", {
+                "coordination_id": coordination_id,
+                "chosen_start": result["candidates"][0]["start"],
+            })
+            assert confirmed["status"] == "confirmed"
+            assert confirmed["event"]["start"] == result["candidates"][0]["start"]
+            assert confirmed["google_calendar_url"].startswith("https://calendar.google.com/")
+            assert confirmed["outlook_calendar_url"].startswith("https://outlook.live.com/")
+            confirmed_result = await call(session, "get_coordination_candidates", {
+                "coordination_id": coordination_id,
+                "limit": 3,
+            })
+            assert confirmed_result["confirmed_event"]["start"] == result["candidates"][0]["start"]
 
             incomplete = await call(session, "coordinate_schedule", {
                 "title": "추가 확인이 필요한 회의",
