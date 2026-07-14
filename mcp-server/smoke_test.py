@@ -287,9 +287,9 @@ async def main() -> None:
                     {"name": "나래", "covers_time_window": True},
                 ],
             })
-            assert partial["status"] == "needs_input"
+            assert partial["status"] == "ready"
             assert partial["missing_participants"] == []
-            assert all("가람" in candidate["unknown_participants"] for candidate in partial["candidates"])
+            assert all(not candidate["unknown_participants"] for candidate in partial["candidates"])
 
             invalid_initial = await call(session, "coordinate_schedule", {
                 "title": "범위 오류 회의",

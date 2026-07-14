@@ -392,8 +392,9 @@ def _normalize_submission(
     avoid: list[TimeIntervalInput],
     prefer: list[TimeIntervalInput],
 ) -> dict:
+    has_constraints = bool(hard_blocks or avoid or prefer)
     return {
-        "covers_time_window": covers_time_window,
+        "covers_time_window": covers_time_window or has_constraints,
         "hard_blocks": [_normalize_interval(item, room) for item in hard_blocks],
         "avoid": [_normalize_interval(item, room) for item in avoid],
         "prefer": [_normalize_interval(item, room) for item in prefer],
@@ -470,7 +471,7 @@ def _rank_candidates(room: dict, limit: int) -> list[MeetingCandidate]:
         fully_confirmed = available_count == len(participants) and not unknown
         reason_parts = [f"가능 확인 {available_count}/{len(participants)}"]
         if avoid_count:
-            reason_parts.append(f"회피 {avoid_count}명")
+            reason_parts.append(f"비선호 {avoid_count}명")
         if prefer_count:
             reason_parts.append(f"선호 {prefer_count}명")
         if unknown:
@@ -524,6 +525,7 @@ def _build_candidate_output(room: dict, limit: int) -> CandidateOutput:
         missing_participants=missing,
         assumptions=[
             "Agent가 Tool 입력으로 전달한 시간만 사용했으며 임의의 채팅방이나 외부 캘린더를 조회하지 않았습니다.",
+            "조건을 하나 이상 제시한 참여자는 명시하지 않은 후보 시간에 참석 가능한 것으로 계산했습니다.",
             "후보는 30분 간격으로 계산했습니다.",
         ],
         risks=risks,
